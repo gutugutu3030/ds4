@@ -19,6 +19,21 @@ The selected build chooses the backend. Pass `-m FILE` for an explicit model.
 Use `--chdir /path/to/ds4` when starting outside the project directory so
 relative runtime files such as Metal kernels can be found.
 
+## Chat page login
+
+```sh
+./ds4-server --host 0.0.0.0 --ui-auth ada:secret
+```
+
+`--ui-auth USER:PASSWORD` makes the chat page at `/` answer `401` with a Basic
+challenge until the browser submits those credentials. Nothing else is gated:
+the `/v1/*` endpoints stay unauthenticated so existing clients keep working, and
+anyone who can reach the port can still call them directly.
+
+Basic sends the password base64-encoded, not encrypted, so use it on a trusted
+network or behind a TLS-terminating proxy. The browser keeps the credentials
+until the tab closes; there is no logout.
+
 ## APIs
 
 | Endpoint | Use |

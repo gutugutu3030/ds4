@@ -6939,6 +6939,27 @@ static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     return ok;
 }
 
+/* The browser login prompt only appears when the challenge header is present,
+ * so this cannot reuse http_error(), which cannot add headers. */
+static bool http_unauthorized(int fd, bool enable_cors) {
+    static const char body[] =
+        "{\"error\":{\"message\":\"authentication required\","
+        "\"type\":\"authentication_error\"}}\n";
+    buf h = {0};
+    buf_printf(&h,
+        "HTTP/1.1 401 Unauthorized\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "WWW-Authenticate: Basic realm=\"ds4\", charset=\"UTF-8\"\r\n",
+        sizeof(body) - 1);
+    if (enable_cors) append_cors_headers(&h);
+    buf_puts(&h, "Connection: close\r\n\r\n");
+    bool ok = send_all(fd, h.ptr, h.len);
+    if (ok) ok = send_all(fd, body, sizeof(body) - 1);
+    buf_free(&h);
+    return ok;
+}
+
 static const char *context_length_error_param(const request *r) {
     if (!r) return "prompt";
     if (r->api == API_RESPONSES) return "input";
@@ -10153,6 +10174,8 @@ struct server {
     server_image_cache image_cache; /* Protected by inference_mu. */
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    const char *ui_auth_user;
+    const char *ui_auth_pass;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -14989,6 +15012,7 @@ static void *slot_worker_main(void *arg) {
 typedef struct {
     char method[8];
     char path[256];
+    char auth[512];
     char *body;
     size_t body_len;
 } http_request;
@@ -15023,6 +15047,38 @@ static long content_length(const char *h, size_t n) {
         if (p < end) p++;
     }
     return 0;
+}
+
+/* Copies one header value out of the raw header block.  Absent headers and
+ * values that do not fit leave out empty, so a truncated credential fails
+ * closed instead of comparing against a prefix. */
+static bool header_value(const char *h, size_t n, const char *name,
+                         char *out, size_t out_len) {
+    if (!out || out_len == 0) return false;
+    out[0] = '\0';
+    const size_t name_len = strlen(name);
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len + 1 && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0) {
+            const char *v = line + name_len + 1;
+            const char *ve = line + len;
+            while (v < ve && isspace((unsigned char)*v)) v++;
+            while (ve > v && isspace((unsigned char)ve[-1])) ve--;
+            size_t vlen = (size_t)(ve - v);
+            if (vlen < out_len) {
+                memcpy(out, v, vlen);
+                out[vlen] = '\0';
+                return true;
+            }
+        }
+        if (p < end) p++;
+    }
+    return false;
 }
 
 static bool read_http_request(int fd, http_request *r) {
@@ -15066,11 +15122,53 @@ static bool read_http_request(int fd, http_request *r) {
     r->body = xmalloc(r->body_len + 1);
     memcpy(r->body, b.ptr + hend, r->body_len);
     r->body[r->body_len] = '\0';
+    (void)header_value(b.ptr, (size_t)hend, "Authorization",
+                       r->auth, sizeof(r->auth));
     buf_free(&b);
     return true;
 fail:
     buf_free(&b);
     return false;
+}
+
+/* Compares a secret against a NUL-terminated expectation without branching on
+ * the first differing byte and without reading past either operand. */
+static bool secret_equal(const char *got, size_t got_len, const char *want) {
+    const size_t want_len = want ? strlen(want) : 0;
+    unsigned diff = got_len == want_len ? 0u : 1u;
+    for (size_t i = 0; i < want_len; i++) {
+        diff |= (unsigned char)got[i < got_len ? i : 0] ^
+                (unsigned char)want[i];
+    }
+    return diff == 0;
+}
+
+/* HTTP Basic check for the chat page.  An empty user means --ui-auth was not
+ * given, which keeps an unauthenticated server the default.  Basic credentials
+ * are base64, not encrypted, so this only ever gates a trusted network or a
+ * TLS-terminating proxy. */
+static bool request_is_authorized(const char *auth_header, const char *user,
+                                 const char *pass) {
+    if (!user || !user[0]) return true;
+    if (!auth_header || strncasecmp(auth_header, "Basic ", 6) != 0) return false;
+
+    uint8_t *cred = NULL;
+    size_t cred_len = 0;
+    if (!server_decode_base64(auth_header + 6, &cred, &cred_len)) return false;
+
+    const uint8_t *colon = memchr(cred, ':', cred_len);
+    bool ok = false;
+    if (colon) {
+        const size_t got_user_len = (size_t)(colon - cred);
+        /* Both halves are compared even when the user is wrong, so the timing
+         * does not reveal which field failed. */
+        bool user_ok = secret_equal((const char *)cred, got_user_len, user);
+        bool pass_ok = secret_equal((const char *)colon + 1,
+                                   cred_len - got_user_len - 1, pass);
+        ok = user_ok && pass_ok;
+    }
+    free(cred);
+    return ok;
 }
 
 typedef struct {
@@ -15286,6 +15384,13 @@ static void *client_main(void *arg) {
     }
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/")) {
+        /* Only the chat page is gated.  The /v1 endpoints stay open for API
+         * clients, which is what --ui-auth deliberately does not cover. */
+        if (!request_is_authorized(hr.auth, s->ui_auth_user, s->ui_auth_pass)) {
+            http_unauthorized(fd, s->enable_cors);
+            http_request_free(&hr);
+            goto done;
+        }
         http_response(fd, s->enable_cors, 200, "text/html",
             "<!DOCTYPE html>\n"
             "<html lang=\"en\">\n"
@@ -16027,6 +16132,8 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    const char *ui_auth_user;
+    const char *ui_auth_pass;
     int batched_sessions;
     int mixed_prefill_quantum;
 } server_config;
@@ -16266,6 +16373,16 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--ui-auth")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            const char *colon = strchr(v, ':');
+            if (!colon || colon == v || !colon[1]) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --ui-auth needs USER:PASSWORD with both parts set");
+                exit(2);
+            }
+            c.ui_auth_user = xstrndup(v, (size_t)(colon - v));
+            c.ui_auth_pass = colon + 1;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -16545,6 +16662,8 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.ui_auth_user = cfg.ui_auth_user;
+    s.ui_auth_pass = cfg.ui_auth_pass;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -16662,6 +16781,12 @@ int main(int argc, char **argv) {
     }
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    if (!cfg.ui_auth_user && strcmp(cfg.host, "127.0.0.1") &&
+        strcmp(cfg.host, "localhost")) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: warning: reachable from %s without a login; pass --ui-auth USER:PASSWORD to gate the chat page",
+                   cfg.host);
+    }
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
@@ -17750,6 +17875,105 @@ static void test_cors_headers_are_opt_in(void) {
         close(sv[0]);
         close(sv[1]);
     }
+}
+
+static void test_http_request_captures_authorization(void) {
+    int sv[2];
+    const char *with_header =
+        "GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dTpw\r\n\r\n";
+    const char *without_header = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(send_all(sv[0], with_header, strlen(with_header)));
+        shutdown(sv[0], SHUT_WR);
+        http_request r = {0};
+        TEST_ASSERT(read_http_request(sv[1], &r));
+        TEST_ASSERT(!strcmp(r.method, "GET"));
+        TEST_ASSERT(!strcmp(r.path, "/"));
+        TEST_ASSERT(!strcmp(r.auth, "Basic dTpw"));
+        http_request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(send_all(sv[0], without_header, strlen(without_header)));
+        shutdown(sv[0], SHUT_WR);
+        http_request r = {0};
+        TEST_ASSERT(read_http_request(sv[1], &r));
+        TEST_ASSERT(r.auth[0] == '\0');
+        http_request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
+static void test_ui_basic_auth_credentials(void) {
+    /* base64("u:p") is "dTpw"; base64("u:p:ss") is "dTpwOnNz". */
+    TEST_ASSERT(request_is_authorized("Basic dTpw", "u", "p"));
+    TEST_ASSERT(request_is_authorized("Basic dTpwOnNz", "u", "p:ss"));
+    TEST_ASSERT(request_is_authorized("basic dTpw", "u", "p"));
+    /* An unset --ui-auth leaves the page open. */
+    TEST_ASSERT(request_is_authorized("", NULL, NULL));
+    TEST_ASSERT(request_is_authorized("", "", ""));
+
+    TEST_ASSERT(!request_is_authorized("", "u", "p"));
+    TEST_ASSERT(!request_is_authorized("Basic dTpw", "u", "wrong"));
+    TEST_ASSERT(!request_is_authorized("Basic dTpw", "other", "p"));
+    TEST_ASSERT(!request_is_authorized("Basic dTpw", "u", "p:ss"));
+    TEST_ASSERT(!request_is_authorized("Bearer dTpw", "u", "p"));
+    TEST_ASSERT(!request_is_authorized("Basic dTpw!", "u", "p"));
+    TEST_ASSERT(!request_is_authorized("Basic cGFzc3dvcmQ=", "u", "p"));
+}
+
+static void test_ui_unauthorized_sends_basic_challenge(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    TEST_ASSERT(http_unauthorized(sv[0], false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 401 Unauthorized") != NULL);
+    TEST_ASSERT(strstr(out, "WWW-Authenticate: Basic") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"authentication_error\"") != NULL);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin") == NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_ui_auth_gates_the_chat_page(void) {
+    server s = {0};
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.clients_cv, NULL);
+    s.ui_auth_user = "u";
+    s.ui_auth_pass = "p";
+
+    /* GET / without and with the Basic credentials for u:p. */
+    struct { const char *request; const char *status; } cases[] = {
+        { "GET / HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 401 Unauthorized" },
+        { "GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dTpw\r\n\r\n",
+          "HTTP/1.1 200 OK" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) break;
+        TEST_ASSERT(send_all(sv[0], cases[i].request, strlen(cases[i].request)));
+        client_arg *ca = xmalloc(sizeof(*ca));
+        ca->srv = &s;
+        ca->fd = sv[1];
+        client_main(ca);              /* reads sv[1], replies, closes it */
+        char *out = read_socket_text(sv[0]);
+        TEST_ASSERT(strstr(out, cases[i].status) != NULL);
+        free(out);
+        close(sv[0]);
+    }
+    pthread_mutex_destroy(&s.mu);
+    pthread_cond_destroy(&s.clients_cv);
 }
 
 static void test_cors_preflight_response_is_no_content(void) {
@@ -23584,6 +23808,10 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
+    test_http_request_captures_authorization();
+    test_ui_basic_auth_credentials();
+    test_ui_unauthorized_sends_basic_challenge();
+    test_ui_auth_gates_the_chat_page();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_stream_reroutes_second_reasoning_pass();
     test_anthropic_usage_reports_cache_details();
