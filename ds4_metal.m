@@ -36594,6 +36594,21 @@ static bool ds4_gpu_glm53_tuning_available(void) {
          ds4_gpu_mpp_available());
 }
 
+/* Fused BF16 projections (qkv, pair, trio, HC expand4) were swept on M3 Ultra,
+ * where every other device keeps the separate matvec chain. The fused kernels
+ * and the standalone kernel all reduce each row through the same
+ * glm53_mul_mv_bf16_f32_row_sum(), so the fused result is the reference result
+ * by construction and the device scope was a measurement boundary, not a
+ * numerical one. The per-fusion switches stay at the call sites in ds4.c
+ * (DS4_METAL_DISABLE_GLM53_{BF16_QKV,KDA_GATE_PAIR,KDA_GATE_TRIO,
+ * KDA_OUT_HC_EXPAND,ATTN_OUT_HC_EXPAND,FFN_HC_EXPAND_ADD,
+ * SHARED_DOWN_HC_EXPAND}); this honors the decode-group master so a single
+ * variable still restores the whole group. */
+static bool ds4_gpu_glm53_bf16_fused_available(void) {
+    if (getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") != NULL) return false;
+    return ds4_gpu_glm53_tuning_available();
+}
+
 int ds4_gpu_glm_qk_lowrank_typed_tensor(
         ds4_gpu_tensor       *qk_low,
         const ds4_gpu_tensor *q,
@@ -47336,7 +47351,7 @@ int ds4_gpu_glm53_matmul_bf16_qkv(
         uint32_t              out_dim,
         const ds4_gpu_tensor *x) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!ds4_gpu_device_name_contains("M3 Ultra")) return 0;
+    if (!ds4_gpu_glm53_bf16_fused_available()) return 0;
     uint64_t weights = 0;
     if (in_dim == 0 || out_dim == 0 ||
         !glm53_gpu_mul_u64(in_dim, out_dim, &weights) ||
@@ -47408,7 +47423,7 @@ int ds4_gpu_glm53_matmul_bf16_pair(
         const ds4_gpu_tensor *x_b) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* Same device scope as the qkv variant this shares a row helper with. */
-    if (!ds4_gpu_device_name_contains("M3 Ultra")) return 0;
+    if (!ds4_gpu_glm53_bf16_fused_available()) return 0;
     uint64_t weights = 0;
     if (in_dim == 0 || out_dim == 0 ||
         !glm53_gpu_mul_u64(in_dim, out_dim, &weights) ||
@@ -47477,7 +47492,7 @@ int ds4_gpu_glm53_matmul_bf16_trio(
         uint32_t              out_dim_c,
         const ds4_gpu_tensor *x) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!ds4_gpu_device_name_contains("M3 Ultra")) return 0;
+    if (!ds4_gpu_glm53_bf16_fused_available()) return 0;
     uint64_t w_ab = 0, w_c = 0;
     if (in_dim == 0 || out_dim_ab == 0 || out_dim_c == 0 ||
         out_dim_c > out_dim_ab ||
@@ -47660,7 +47675,7 @@ int ds4_gpu_glm53_matmul_bf16_hc_expand4(
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* Same device scope as the qkv and pair variants this shares a row helper
      * with; every other device keeps the separate matvec and expand. */
-    if (!ds4_gpu_device_name_contains("M3 Ultra")) return 0;
+    if (!ds4_gpu_glm53_bf16_fused_available()) return 0;
     if (n_hc != 4u) return 0;
     uint64_t weights = 0;
     if (in_dim == 0 || out_dim == 0 ||
