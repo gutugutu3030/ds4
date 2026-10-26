@@ -349,10 +349,12 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--ui-auth USER:PASSWORD", "Require an HTTP Basic login to open the chat page. /v1/* endpoints stay unauthenticated.");
+    opt(fp, c, "--ui-auth-file FILE", "Same login, read from the first line of FILE. Keeps it out of ps and the unit file.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
     para(fp, c, "--allow-host takes an IPv4 address (192.168.11.42), a CIDR prefix (192.168.11.0/24), or localhost (the whole 127.0.0.0/8 block). It filters the peer address of each connection before the request is read, and a peer outside the list is closed without a response. Without it every peer the bind address can reach is accepted, as before. The server listens on IPv4 only, so a Tailscale peer appears with its 100.64.0.0/10 address and an IPv6-only peer cannot reach it at all.");
+    para(fp, c, "--ui-auth-file reads USER:PASSWORD from the first line of a file so the credential stays out of the process arguments and out of the unit file that starts the server. The file must not be readable or writable by other users, and each part must fit in 256 bytes, which is all an HTTP Basic header can carry.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);

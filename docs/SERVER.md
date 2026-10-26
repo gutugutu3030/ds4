@@ -66,13 +66,35 @@ relative runtime files such as Metal kernels can be found.
 ## Chat page login
 
 ```sh
-./ds4-server --host 0.0.0.0 --ui-auth ada:secret
+./ds4-server --ui-auth-file /usr/local/etc/ds4/ui-auth
 ```
 
 `--ui-auth USER:PASSWORD` makes the chat page at `/` answer `401` with a Basic
 challenge until the browser submits those credentials. Nothing else is gated:
 the `/v1/*` endpoints stay unauthenticated so existing clients keep working, and
 anyone who can reach the port can still call them directly.
+
+`--ui-auth-file FILE` reads the same `USER:PASSWORD` from the first line of a
+file, and is the form to use wherever the server is started for you. Arguments
+are readable to every local user through `ps`, and a launcher that keeps its
+whole command line in a unit file stores the password there too.
+
+`./setup_ui_auth.sh` does that for you: it prompts for the password twice with
+echoing off, writes the file `600`, and hands it to the account the server runs
+as. The password never appears in a command argument or in `ps`.
+
+```sh
+./setup_ui_auth.sh                      # defaults: login $USER, service user llm
+./setup_ui_auth.sh -u ada -s ds4 -f /usr/local/etc/ds4/ui-auth
+```
+
+The server refuses to start when the file is readable or writable by other
+users, since a credential anyone can read is not one; group access is allowed and
+gets noted, so a service account reading through its own group works as
+`root:service 0640`. One `USER:PASSWORD` per file, `:` splitting at the first
+occurrence so the password may contain more. Each part has to fit in 256 bytes,
+which is what an HTTP Basic header can carry: longer input stops startup rather
+than producing a login that can never succeed.
 
 Basic sends the password base64-encoded, not encrypted, so use it on a trusted
 network or behind a TLS-terminating proxy. The browser keeps the credentials

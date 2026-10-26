@@ -16358,8 +16358,8 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
-    const char *ui_auth_user;
-    const char *ui_auth_pass;
+    char *ui_auth_user;   /* heap copies: argv stays free of the credential */
+    char *ui_auth_pass;
     int batched_sessions;
     int mixed_prefill_quantum;
 } server_config;
@@ -16522,6 +16522,94 @@ static ds4_backend default_server_backend(void) {
 #endif
 }
 
+/* A Basic credential has to fit the 512-byte header buffer the request parser
+ * fills: "Basic " plus base64 of USER:PASSWORD, so four bytes of secret already
+ * need more than half of it.  Capping the stored copy turns a line that could
+ * never authenticate into a startup error instead of a silent lock-out. */
+#define DS4_SERVER_UI_AUTH_MAX 256
+
+/* Copies both parts: the credential is compared for the life of the server, and
+ * a pointer into argv stays readable to every local user in `ps`. */
+static bool server_parse_ui_auth(const char *line, const char *source,
+                                 char **user, char **pass,
+                                 char *err, size_t errlen) {
+    if (!line || !line[0]) {
+        snprintf(err, errlen, "%s is empty", source);
+        return false;
+    }
+    const char *colon = strchr(line, ':');
+    if (!colon || colon == line || !colon[1]) {
+        snprintf(err, errlen, "%s needs USER:PASSWORD with both parts set", source);
+        return false;
+    }
+    if ((size_t)(colon - line) > DS4_SERVER_UI_AUTH_MAX ||
+        strlen(colon + 1) > DS4_SERVER_UI_AUTH_MAX) {
+        snprintf(err, errlen, "%s: USER and PASSWORD must each be at most %d bytes; "
+                              "a longer credential never fits an HTTP Basic header",
+                 source, DS4_SERVER_UI_AUTH_MAX);
+        return false;
+    }
+    *user = xstrndup(line, (size_t)(colon - line));
+    *pass = xstrdup(colon + 1);
+    return true;
+}
+
+/* Reading the credential from a file keeps it out of argv and out of the unit
+ * file that starts the service.  A credential other users can read is no
+ * credential, so world access stops startup rather than being noted. */
+static bool server_load_ui_auth_file(const char *path, char **user, char **pass,
+                                     char *err, size_t errlen) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(err, errlen, "--ui-auth-file cannot read %s: %s", path, strerror(errno));
+        return false;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        snprintf(err, errlen, "--ui-auth-file cannot stat %s: %s", path, strerror(errno));
+        close(fd);
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        snprintf(err, errlen, "--ui-auth-file %s is not a regular file", path);
+        close(fd);
+        return false;
+    }
+    if (st.st_mode & 0007) {
+        snprintf(err, errlen, "--ui-auth-file %s is readable or writable by other users "
+                              "(mode %04o); run chmod 600 on it",
+                 path, (unsigned)(st.st_mode & 07777));
+        close(fd);
+        return false;
+    }
+    if (st.st_mode & 0070) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: note: %s is group-accessible (mode %04o); that is the "
+                   "right shape when the service user reads it through that group",
+                   path, (unsigned)(st.st_mode & 07777));
+    }
+
+    /* Enough for the longest credential that can work, so a file holding more
+     * than that still reaches the length check instead of being accepted
+     * shortened. */
+    char buf[DS4_SERVER_UI_AUTH_MAX * 2 + 8];
+    ssize_t got = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (got < 0) {
+        snprintf(err, errlen, "--ui-auth-file cannot read %s: %s", path, strerror(errno));
+        return false;
+    }
+    buf[got] = '\0';
+    char *newline = strpbrk(buf, "\r\n");
+    if (newline) *newline = '\0';
+    if (!buf[0]) {
+        snprintf(err, errlen, "--ui-auth-file %s has no USER:PASSWORD on its first line",
+                 path);
+        return false;
+    }
+    return server_parse_ui_auth(buf, path, user, pass, err, errlen);
+}
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -16630,16 +16718,24 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
-        } else if (!strcmp(arg, "--ui-auth")) {
-            const char *v = need_arg(&i, argc, argv, arg);
-            const char *colon = strchr(v, ':');
-            if (!colon || colon == v || !colon[1]) {
+        } else if (!strcmp(arg, "--ui-auth") || !strcmp(arg, "--ui-auth-file")) {
+            bool from_file = !strcmp(arg, "--ui-auth-file");
+            if (c.ui_auth_user) {
                 server_log(DS4_LOG_DEFAULT,
-                           "ds4-server: --ui-auth needs USER:PASSWORD with both parts set");
+                           "ds4-server: pass only one of --ui-auth and --ui-auth-file");
                 exit(2);
             }
-            c.ui_auth_user = xstrndup(v, (size_t)(colon - v));
-            c.ui_auth_pass = colon + 1;
+            char err[256] = {0};
+            const char *value = need_arg(&i, argc, argv, arg);
+            bool ok = from_file ?
+                server_load_ui_auth_file(value, &c.ui_auth_user, &c.ui_auth_pass,
+                                         err, sizeof(err)) :
+                server_parse_ui_auth(value, "--ui-auth", &c.ui_auth_user,
+                                     &c.ui_auth_pass, err, sizeof(err));
+            if (!ok) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: %s", err);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -24182,8 +24278,143 @@ static void test_server_allow_host_list(void) {
         TEST_ASSERT(server_reject_first_seen(&seen, (uint32_t)0x1000000u + (uint32_t)i));
 }
 
+/* Writes one credential file and returns its path in the caller's buffer. */
+static void test_ui_auth_file(char *path, size_t pathlen, const char *content,
+                              mode_t mode) {
+    snprintf(path, pathlen, "/tmp/ds4_ui_auth_%d", (int)getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    if (content) {
+        ssize_t w = write(fd, content, strlen(content));
+        (void)w;
+    }
+    if (fchmod(fd, mode) != 0) server_log(DS4_LOG_DEFAULT, "test: fchmod failed");
+    close(fd);
+}
+
+static void test_server_ui_auth_credential(void) {
+    char err[256];
+    char *user = NULL;
+    char *pass = NULL;
+
+    memset(err, 0, sizeof(err));
+    TEST_ASSERT(server_parse_ui_auth("ada:secret", "--ui-auth", &user, &pass,
+                                     err, sizeof(err)));
+    TEST_ASSERT(user && pass && !strcmp(user, "ada") && !strcmp(pass, "secret"));
+    /* The request parser splits at the first colon too, so a password may hold
+     * more of them. */
+    TEST_ASSERT(server_parse_ui_auth("ada:a:b", "--ui-auth", &user, &pass,
+                                     err, sizeof(err)));
+    TEST_ASSERT(!strcmp(user, "ada") && !strcmp(pass, "a:b"));
+
+    static const char *bad[] = { "", "noseparator", ":onlypass", "user:", ":" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        user = pass = NULL;
+        memset(err, 0, sizeof(err));
+        TEST_ASSERT(!server_parse_ui_auth(bad[i], "--ui-auth", &user, &pass,
+                                          err, sizeof(err)));
+        TEST_ASSERT(!user && !pass);
+        TEST_ASSERT(err[0] != '\0');
+    }
+
+    /* A credential longer than the Basic header can carry is refused now, not
+     * silently unauthenticatable later. */
+    char line[DS4_SERVER_UI_AUTH_MAX * 2 + 8];
+    memset(line, 'a', DS4_SERVER_UI_AUTH_MAX + 1);
+    line[DS4_SERVER_UI_AUTH_MAX + 1] = ':';
+    line[DS4_SERVER_UI_AUTH_MAX + 2] = 'x';
+    line[DS4_SERVER_UI_AUTH_MAX + 3] = '\0';
+    user = pass = NULL;
+    memset(err, 0, sizeof(err));
+    TEST_ASSERT(!server_parse_ui_auth(line, "--ui-auth", &user, &pass, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "Basic header") != NULL);
+
+    memset(line, 'a', DS4_SERVER_UI_AUTH_MAX);
+    line[DS4_SERVER_UI_AUTH_MAX] = ':';
+    memset(line + DS4_SERVER_UI_AUTH_MAX + 1, 'b', DS4_SERVER_UI_AUTH_MAX + 1);
+    line[DS4_SERVER_UI_AUTH_MAX * 2 + 2] = '\0';
+    user = pass = NULL;
+    TEST_ASSERT(!server_parse_ui_auth(line, "--ui-auth", &user, &pass, err, sizeof(err)));
+
+    memset(line, 'a', DS4_SERVER_UI_AUTH_MAX);
+    line[DS4_SERVER_UI_AUTH_MAX] = ':';
+    memset(line + DS4_SERVER_UI_AUTH_MAX + 1, 'b', DS4_SERVER_UI_AUTH_MAX);
+    line[DS4_SERVER_UI_AUTH_MAX * 2 + 1] = '\0';
+    user = pass = NULL;
+    TEST_ASSERT(server_parse_ui_auth(line, "--ui-auth", &user, &pass, err, sizeof(err)));
+    TEST_ASSERT(user && pass && strlen(user) == DS4_SERVER_UI_AUTH_MAX &&
+                strlen(pass) == DS4_SERVER_UI_AUTH_MAX);
+
+    char path[64];
+
+    /* 600 is the expected shape, and the trailing newline is not part of it. */
+    test_ui_auth_file(path, sizeof(path), "ada:secret\n", 0600);
+    user = pass = NULL;
+    memset(err, 0, sizeof(err));
+    TEST_ASSERT(server_load_ui_auth_file(path, &user, &pass, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(user, "ada") && !strcmp(pass, "secret"));
+    unlink(path);
+
+    /* CRLF, as a file edited on Windows or copied from a plist carries it. */
+    test_ui_auth_file(path, sizeof(path), "ada:secret\r\n", 0600);
+    user = pass = NULL;
+    TEST_ASSERT(server_load_ui_auth_file(path, &user, &pass, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(pass, "secret"));
+    unlink(path);
+
+    /* Group access is allowed: a daemon reading through its service group is a
+     * legitimate shape, so it only gets noted. */
+    test_ui_auth_file(path, sizeof(path), "ada:secret\n", 0640);
+    user = pass = NULL;
+    TEST_ASSERT(server_load_ui_auth_file(path, &user, &pass, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(pass, "secret"));
+
+    /* World access means any local user holds the credential, so it stops. */
+    TEST_ASSERT(chmod(path, 0644) == 0);
+    user = pass = NULL;
+    memset(err, 0, sizeof(err));
+    TEST_ASSERT(!server_load_ui_auth_file(path, &user, &pass, err, sizeof(err)));
+    TEST_ASSERT(!user && !pass);
+    TEST_ASSERT(strstr(err, "chmod 600") != NULL);
+    /* World write without read is still world access. */
+    TEST_ASSERT(chmod(path, 0602) == 0);
+    user = pass = NULL;
+    TEST_ASSERT(!server_load_ui_auth_file(path, &user, &pass, err, sizeof(err)));
+    unlink(path);
+
+    /* The round trip that actually decides whether the chat page opens.  A
+     * trailing newline left in the file, or a password truncated at the copy,
+     * would make the page impossible to log into forever. */
+    test_ui_auth_file(path, sizeof(path), "ada:hunter2\n", 0600);
+    user = pass = NULL;
+    TEST_ASSERT(server_load_ui_auth_file(path, &user, &pass, err, sizeof(err)));
+    TEST_ASSERT(request_is_authorized("Basic YWRhOmh1bnRlcjI=", user, pass));
+    TEST_ASSERT(!request_is_authorized("Basic YWRhOndyb25nOQ==", user, pass));
+    TEST_ASSERT(!request_is_authorized(NULL, user, pass));
+    TEST_ASSERT(!request_is_authorized("Bearer YWRhOmh1bnRlcjI=", user, pass));
+    unlink(path);
+
+    /* Empty file, a blank first line, a directory, and a missing path. */
+    test_ui_auth_file(path, sizeof(path), "", 0600);
+    user = pass = NULL;
+    TEST_ASSERT(!server_load_ui_auth_file(path, &user, &pass, err, sizeof(err)));
+    unlink(path);
+    test_ui_auth_file(path, sizeof(path), "\nada:secret\n", 0600);
+    user = pass = NULL;
+    TEST_ASSERT(!server_load_ui_auth_file(path, &user, &pass, err, sizeof(err)));
+    unlink(path);
+    user = pass = NULL;
+    TEST_ASSERT(!server_load_ui_auth_file("/tmp", &user, &pass, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "regular file") != NULL);
+    user = pass = NULL;
+    TEST_ASSERT(!server_load_ui_auth_file("/tmp/ds4_ui_auth_does_not_exist",
+                                          &user, &pass, err, sizeof(err)));
+    TEST_ASSERT(err[0] != '\0');
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_server_allow_host_list();
+    test_server_ui_auth_credential();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
