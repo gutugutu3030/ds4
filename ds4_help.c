@@ -344,13 +344,15 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
 
 static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
-    opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
+    opt(fp, c, "--host HOST", "Bind address. Repeatable or comma-separated. Default: 127.0.0.1");
+    opt(fp, c, "--allow-host SPEC", "Accept only these peers. Repeatable or comma-separated.");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--ui-auth USER:PASSWORD", "Require an HTTP Basic login to open the chat page. /v1/* endpoints stay unauthenticated.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
+    para(fp, c, "--allow-host takes an IPv4 address (192.168.11.42), a CIDR prefix (192.168.11.0/24), or localhost (the whole 127.0.0.0/8 block). It filters the peer address of each connection before the request is read, and a peer outside the list is closed without a response. Without it every peer the bind address can reach is accepted, as before. The server listens on IPv4 only, so a Tailscale peer appears with its 100.64.0.0/10 address and an IPv6-only peer cannot reach it at all.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);

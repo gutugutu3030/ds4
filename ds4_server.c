@@ -42,7 +42,12 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop_requested = 0;
-static volatile sig_atomic_t g_listen_fd = -1;
+
+/* One listener per --host.  The stop handler closes them all so a blocked
+ * poll() wakes without a self-pipe; the accept loop treats -1 as "gone". */
+#define DS4_SERVER_MAX_HOSTS 8
+static volatile sig_atomic_t g_listen_fds[DS4_SERVER_MAX_HOSTS];
+static volatile sig_atomic_t g_listen_count = 0;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
@@ -57,10 +62,10 @@ static void stop_signal_handler(int sig) {
     (void)sig;
     if (g_stop_requested) _exit(130);
     g_stop_requested = 1;
-    if (g_listen_fd >= 0) {
-        int fd = (int)g_listen_fd;
-        g_listen_fd = -1;
-        close(fd);
+    for (int i = 0; i < g_listen_count; i++) {
+        int fd = (int)g_listen_fds[i];
+        g_listen_fds[i] = -1;
+        if (fd >= 0) close(fd);
     }
 }
 
@@ -16083,6 +16088,214 @@ done:
     return NULL;
 }
 
+/* Peer allowlist.  Binding a port makes this server dialable by everything that
+ * can route to it, and /v1 has no login of its own, so access control is a
+ * source-address decision taken in the accept loop: before a request byte is
+ * read, before a client thread exists, before the job queue grows.  IPv4 only,
+ * because listen_on() speaks IPv4 only.  An unset list means "no restriction",
+ * which is the behaviour that predates --allow-host. */
+#define DS4_SERVER_MAX_ALLOW 32
+
+typedef struct {
+    uint32_t net;   /* network address, host byte order, already masked */
+    uint32_t mask;  /* prefix mask, host byte order */
+} server_allow_entry;
+
+typedef struct {
+    server_allow_entry v[DS4_SERVER_MAX_ALLOW];
+    int len;
+    bool restricted;  /* false until the first --allow-host value is accepted */
+} server_allow_list;
+
+/* Strict dotted-quad.  inet_pton() is already stricter than inet_aton(), but it
+ * is not the same parser everywhere, and a leading zero means octal to some
+ * resolvers: 010.1.1.1 must never be read as 8.1.1.1 by an allowlist entry. */
+static bool server_ipv4_dotted(const char *s) {
+    int dots = 0;
+    for (const char *p = s; ; ) {
+        if (!isdigit((unsigned char)*p)) return false;
+        if (*p == '0' && isdigit((unsigned char)p[1])) return false;
+        while (isdigit((unsigned char)*p)) p++;
+        if (!*p) return dots == 3;
+        if (*p != '.') return false;
+        dots++;
+        p++;
+    }
+}
+
+static bool server_allow_parse_one(server_allow_list *al, const char *spec,
+                                   char *err, size_t errlen) {
+    char buf[64];
+    if (!spec || strlen(spec) >= sizeof(buf)) {
+        snprintf(err, errlen, "--allow-host value is missing or too long");
+        return false;
+    }
+    size_t n = 0;
+    const char *p = spec;
+    while (*p == ' ' || *p == '\t') p++;
+    while (*p) buf[n++] = *p++;
+    while (n && (buf[n - 1] == ' ' || buf[n - 1] == '\t')) n--;
+    buf[n] = '\0';
+    if (!strcmp(buf, "localhost")) {
+        /* The whole loopback block, not just .1: any 127/8 address reaches an
+         * IPv4 listener as itself. */
+        memcpy(buf, "127.0.0.0/8", sizeof("127.0.0.0/8"));
+        n = strlen(buf);
+    }
+    if (!n) {
+        snprintf(err, errlen, "--allow-host needs a value like 127.0.0.1, "
+                              "192.168.11.0/24 or localhost");
+        return false;
+    }
+
+    unsigned bits = 32;
+    char *slash = strchr(buf, '/');
+    if (slash) {
+        *slash = '\0';
+        const char *b = slash + 1;
+        if (strlen(b) < 1 || strlen(b) > 2) {
+            snprintf(err, errlen, "--allow-host %s: the prefix must be 0-32", spec);
+            return false;
+        }
+        for (const char *q = b; *q; q++) {
+            if (!isdigit((unsigned char)*q)) {
+                snprintf(err, errlen, "--allow-host %s: the prefix must be 0-32", spec);
+                return false;
+            }
+        }
+        bits = (unsigned)atoi(b);
+        if (bits > 32) {
+            snprintf(err, errlen, "--allow-host %s: the prefix must be 0-32", spec);
+            return false;
+        }
+    }
+    if (!server_ipv4_dotted(buf)) {
+        snprintf(err, errlen, "--allow-host %s: not a dotted IPv4 address; "
+                              "host names and IPv6 are not supported", spec);
+        return false;
+    }
+    struct in_addr addr;
+    if (inet_pton(AF_INET, buf, &addr) != 1) {
+        snprintf(err, errlen, "--allow-host %s: cannot parse the address", spec);
+        return false;
+    }
+    uint32_t host = ntohl(addr.s_addr);
+    uint32_t mask = bits == 0 ? 0u : ~(uint32_t)0 << (32 - bits);
+    if ((host & ~mask) != 0) {
+        /* Refusing here is deliberate: silently masking 192.168.11.42/24 down to
+         * the whole /24 would widen access exactly where a typo was made. */
+        uint32_t net = host & mask;
+        struct in_addr na;
+        na.s_addr = htonl(net);
+        char net_text[INET_ADDRSTRLEN] = "?";
+        if (!inet_ntop(AF_INET, &na, net_text, sizeof(net_text)))
+            net_text[0] = '\0';
+        snprintf(err, errlen, "--allow-host %s has host bits set; the network is "
+                              "%s/%u, or name one address with a /32", spec, net_text, bits);
+        return false;
+    }
+    if (al->len >= DS4_SERVER_MAX_ALLOW) {
+        snprintf(err, errlen, "--allow-host: at most %d entries", DS4_SERVER_MAX_ALLOW);
+        return false;
+    }
+    for (int i = 0; i < al->len; i++)
+        if (al->v[i].net == (host & mask) && al->v[i].mask == mask) return true;
+    al->v[al->len].net = host & mask;
+    al->v[al->len].mask = mask;
+    al->len++;
+    al->restricted = true;
+    return true;
+}
+
+/* One --allow-host value may itself list several specs ("127.0.0.0/8,10.0.0.5"),
+ * and the option may be repeated.  A bad spec is fatal at startup: a silently
+ * dropped entry would look like protection that is not there. */
+static bool server_allow_parse_value(server_allow_list *al, const char *value,
+                                     char *err, size_t errlen) {
+    int had_len = al->len;
+    bool had_restricted = al->restricted;
+    const char *p = value;
+    do {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        char piece[64];
+        if (len >= sizeof(piece)) {
+            snprintf(err, errlen, "--allow-host entry is too long");
+            goto failed;
+        }
+        memcpy(piece, p, len);
+        piece[len] = '\0';
+        if (!server_allow_parse_one(al, piece, err, errlen)) goto failed;
+        if (!comma) break;
+        p = comma + 1;
+    } while (1);
+    return true;
+failed:
+    /* Leave no half-parsed value behind: the caller reports one error and stops,
+     * and a filter that partly applied would be worse than none at all. */
+    al->len = had_len;
+    al->restricted = had_restricted;
+    return false;
+}
+
+static bool server_allow_permits(const server_allow_list *al,
+                                 const struct sockaddr *sa, socklen_t salen,
+                                 uint32_t *peer_out) {
+    if (!al->restricted) return true;
+    /* A family we cannot inspect is refused.  This listener is IPv4, so that is
+     * only reachable by something unexpected, and guessing is not the default. */
+    if (!sa || salen < (socklen_t)sizeof(struct sockaddr_in) ||
+        sa->sa_family != AF_INET) return false;
+    uint32_t peer = ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr);
+    if (peer_out) *peer_out = peer;
+    for (int i = 0; i < al->len; i++)
+        if ((peer & al->v[i].mask) == al->v[i].net) return true;
+    return false;
+}
+
+typedef struct {
+    uint32_t peer[8];
+    int len;
+} server_reject_seen;
+
+/* One log line per rejected peer rather than one per connection, so a scanning
+ * host cannot fill the log.  When the table is full logging resumes: noise is
+ * better for an operator than silence. */
+static bool server_reject_first_seen(server_reject_seen *rs, uint32_t peer) {
+    for (int i = 0; i < rs->len; i++)
+        if (rs->peer[i] == peer) return false;
+    if (rs->len < (int)(sizeof(rs->peer) / sizeof(rs->peer[0])))
+        rs->peer[rs->len++] = peer;
+    return true;
+}
+
+static void server_close_listeners(void) {
+    for (int i = 0; i < g_listen_count; i++) {
+        int fd = (int)g_listen_fds[i];
+        g_listen_fds[i] = -1;
+        if (fd >= 0) close(fd);
+    }
+    g_listen_count = 0;
+}
+
+/* The startup log repeats the filter back: an operator who typed 192.168.11.42
+ * should see 192.168.11.42/32, not have to trust that it was understood. */
+static void server_allow_describe(const server_allow_list *al, char *out, size_t outlen) {
+    size_t n = 0;
+    out[0] = '\0';
+    for (int i = 0; i < al->len && n + 1 < outlen; i++) {
+        struct in_addr a;
+        a.s_addr = htonl(al->v[i].net);
+        char text[INET_ADDRSTRLEN] = "?";
+        if (!inet_ntop(AF_INET, &a, text, sizeof(text))) continue;
+        unsigned bits = 0;
+        for (uint32_t m = al->v[i].mask; m; m <<= 1) bits++;
+        int w = snprintf(out + n, outlen - n, "%s%s/%u", i ? "," : "", text, bits);
+        if (w < 0 || (size_t)w >= outlen - n) break;
+        n += (size_t)w;
+    }
+}
+
 static int listen_on(const char *host, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -16130,7 +16343,9 @@ typedef struct {
     ds4_engine_options engine;
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
-    const char *host;
+    const char *hosts[DS4_SERVER_MAX_HOSTS];
+    int n_hosts;
+    server_allow_list allow;
     int port;
     int ctx_size;
     int default_tokens;
@@ -16185,6 +16400,31 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
         exit(2);
     }
     return argv[++(*i)];
+}
+
+/* --host may be repeated or comma-separated, so one process can hold loopback
+ * and a tailnet address without binding the wildcard. */
+static void server_append_host_arg(server_config *c, const char *value) {
+    const char *p = value;
+    do {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (!len) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: empty --host value");
+            exit(2);
+        }
+        if (c->n_hosts >= DS4_SERVER_MAX_HOSTS) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: --host accepts at most %d addresses",
+                       DS4_SERVER_MAX_HOSTS);
+            exit(2);
+        }
+        char *piece = xmalloc(len + 1);
+        memcpy(piece, p, len);
+        piece[len] = '\0';
+        c->hosts[c->n_hosts++] = piece;
+        if (!comma) break;
+        p = comma + 1;
+    } while (1);
 }
 
 static void log_context_memory(ds4_backend backend, int ctx_size,
@@ -16290,7 +16530,6 @@ static server_config parse_options(int argc, char **argv) {
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
-        .host = "127.0.0.1",
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
@@ -16379,7 +16618,14 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--host")) {
-            c.host = need_arg(&i, argc, argv, arg);
+            server_append_host_arg(&c, need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--allow-host")) {
+            char err[256] = {0};
+            if (!server_allow_parse_value(&c.allow, need_arg(&i, argc, argv, arg),
+                                          err, sizeof(err))) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: %s", err);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
@@ -16543,6 +16789,7 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --role worker is a serving mode; start tensor-parallel workers with ./ds4");
         exit(2);
     }
+    if (!c.n_hosts) c.hosts[c.n_hosts++] = "127.0.0.1";
     return c;
 }
 
@@ -16774,66 +17021,140 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int lfd = listen_on(cfg.host, cfg.port);
-    if (lfd < 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s", cfg.host, cfg.port, strerror(errno));
-        server_request_worker_stop(&s);
-        if (s.batched_mode) {
-            for (int i = 0; i < slot_threads_started; i++) {
-                pthread_join(s.slot_threads[i], NULL);
-            }
-            server_request_decode_stop(&s);
-            if (decode_thread_started) pthread_join(s.decode_thread, NULL);
-        } else {
-            pthread_join(worker, NULL);
-        }
-        server_close_resources(&s);
-        return 1;
-    }
-    g_listen_fd = lfd;
-    server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
-    if (!cfg.ui_auth_user && strcmp(cfg.host, "127.0.0.1") &&
-        strcmp(cfg.host, "localhost")) {
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: warning: reachable from %s without a login; pass --ui-auth USER:PASSWORD to gate the chat page",
-                   cfg.host);
-    }
-
-    while (!g_stop_requested) {
-        int fd = accept(lfd, NULL, NULL);
+    for (int i = 0; i < DS4_SERVER_MAX_HOSTS; i++) g_listen_fds[i] = -1;
+    for (int h = 0; h < cfg.n_hosts; h++) {
+        int fd = listen_on(cfg.hosts[h], cfg.port);
         if (fd < 0) {
-            if (g_stop_requested) break;
-            if (errno == EINTR) continue;
-            server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
-            continue;
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s", cfg.hosts[h], cfg.port, strerror(errno));
+            server_close_listeners();
+            server_request_worker_stop(&s);
+            if (s.batched_mode) {
+                for (int i = 0; i < slot_threads_started; i++) {
+                    pthread_join(s.slot_threads[i], NULL);
+                }
+                server_request_decode_stop(&s);
+                if (decode_thread_started) pthread_join(s.decode_thread, NULL);
+            } else {
+                pthread_join(worker, NULL);
+            }
+            server_close_resources(&s);
+            return 1;
         }
-        if (g_stop_requested) {
-            close(fd);
-            break;
-        }
-
-        configure_client_socket(fd);
-        client_arg *ca = xmalloc(sizeof(*ca));
-        ca->srv = &s;
-        ca->fd = fd;
-        pthread_mutex_lock(&s.mu);
-        s.clients++;
-        pthread_mutex_unlock(&s.mu);
-        pthread_t th;
-        if (pthread_create(&th, NULL, client_main, ca) != 0) {
-            pthread_mutex_lock(&s.mu);
-            s.clients--;
-            pthread_cond_broadcast(&s.clients_cv);
-            pthread_mutex_unlock(&s.mu);
-            free(ca);
-            close(fd);
-            continue;
-        }
-        pthread_detach(th);
+        /* Store, then count: the stop handler closes only what the count it
+         * reads covers. */
+        g_listen_fds[g_listen_count++] = fd;
+        server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.hosts[h], cfg.port);
     }
-    if (g_listen_fd >= 0) {
-        close(lfd);
-        g_listen_fd = -1;
+
+    if (cfg.allow.restricted) {
+        char list[DS4_SERVER_MAX_ALLOW * (INET_ADDRSTRLEN + 4)];
+        server_allow_describe(&cfg.allow, list, sizeof(list));
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: accepting only these peers: %s; any other peer is closed without a response",
+                   list);
+    } else {
+        bool off_loopback = false;
+        for (int h = 0; h < cfg.n_hosts; h++) {
+            if (strcmp(cfg.hosts[h], "127.0.0.1") && strcmp(cfg.hosts[h], "localhost"))
+                off_loopback = true;
+        }
+        if (off_loopback) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: warning: every endpoint, /v1 included, is reachable without a login; "
+                       "pass --allow-host CIDR to accept only the peers you use "
+                       "(--ui-auth gates the chat page only)");
+        }
+    }
+
+    server_reject_seen rejects = {0};
+    long rejected = 0;
+    while (!g_stop_requested) {
+        struct pollfd pfd[DS4_SERVER_MAX_HOSTS];
+        nfds_t ready = 0;
+        for (int i = 0; i < g_listen_count; i++) {
+            int fd = (int)g_listen_fds[i];
+            if (fd < 0) continue;  /* the stop handler closed this listener */
+            pfd[ready].fd = fd;
+            pfd[ready].events = POLLIN;
+            pfd[ready].revents = 0;
+            ready++;
+        }
+        if (!ready) break;
+        /* The bounded wait keeps shutdown independent of the handler closing a
+         * descriptor under the loop, which matters now that there can be more
+         * than one listener. */
+        int pr = poll(pfd, ready, 250);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            if (g_stop_requested) break;
+            server_log(DS4_LOG_DEFAULT, "ds4-server: accept poll failed: %s", strerror(errno));
+            continue;
+        }
+        for (nfds_t i = 0; i < ready; i++) {
+            if (!(pfd[i].revents & POLLIN)) continue;
+            struct sockaddr_storage ss;
+            socklen_t ss_len = (socklen_t)sizeof(ss);
+            int fd = accept(pfd[i].fd, (struct sockaddr *)&ss, &ss_len);
+            if (fd < 0) {
+                if (errno == EINTR || errno == ECONNABORTED || errno == EBADF ||
+                    errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                if (g_stop_requested) break;
+                server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
+                continue;
+            }
+            if (g_stop_requested) {
+                close(fd);
+                break;
+            }
+
+            uint32_t peer = 0;
+            if (!server_allow_permits(&cfg.allow, (struct sockaddr *)&ss, ss_len, &peer)) {
+                /* Rejected before a request byte is read, so a refused peer
+                 * allocates neither a client thread nor a body buffer.  The peer
+                 * is logged so an operator can read the real address back and
+                 * add it; a port scan stays at one line per address. */
+                char peer_text[INET_ADDRSTRLEN + 20] = "unknown";
+                if (ss.ss_family == AF_INET) {
+                    struct in_addr a = ((const struct sockaddr_in *)&ss)->sin_addr;
+                    if (!inet_ntop(AF_INET, &a, peer_text, sizeof(peer_text)))
+                        snprintf(peer_text, sizeof(peer_text), "unknown");
+                } else {
+                    peer = 0;
+                    snprintf(peer_text, sizeof(peer_text), "non-IPv4 peer (family %d)",
+                             (int)ss.ss_family);
+                }
+                close(fd);
+                rejected++;
+                if (server_reject_first_seen(&rejects, peer))
+                    server_log(DS4_LOG_DEFAULT,
+                               "ds4-server: refused peer %s: not in --allow-host", peer_text);
+                continue;
+            }
+
+            configure_client_socket(fd);
+            client_arg *ca = xmalloc(sizeof(*ca));
+            ca->srv = &s;
+            ca->fd = fd;
+            pthread_mutex_lock(&s.mu);
+            s.clients++;
+            pthread_mutex_unlock(&s.mu);
+            pthread_t th;
+            if (pthread_create(&th, NULL, client_main, ca) != 0) {
+                pthread_mutex_lock(&s.mu);
+                s.clients--;
+                pthread_cond_broadcast(&s.clients_cv);
+                pthread_mutex_unlock(&s.mu);
+                free(ca);
+                close(fd);
+                continue;
+            }
+            pthread_detach(th);
+        }
+    }
+    server_close_listeners();
+    if (rejected) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: refused %ld connection(s) outside --allow-host", rejected);
     }
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
@@ -23755,7 +24076,114 @@ static void test_deepseek41_live_result_order(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static bool server_allow_permits_text(const server_allow_list *al, const char *text) {
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    if (inet_pton(AF_INET, text, &peer.sin_addr) != 1) return false;
+    return server_allow_permits(al, (struct sockaddr *)&peer, (socklen_t)sizeof(peer), NULL);
+}
+
+static void test_server_allow_host_list(void) {
+    char err[256];
+    server_allow_list al = {0};
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+
+    /* No --allow-host means no restriction, which is what servers that predate
+     * the option keep getting. */
+    TEST_ASSERT(server_allow_permits(&al, (struct sockaddr *)&peer,
+                                     (socklen_t)sizeof(peer), NULL));
+    TEST_ASSERT(!al.restricted);
+
+    /* The shape the option exists for: loopback, one LAN machine, a tailnet. */
+    memset(err, 0, sizeof(err));
+    TEST_ASSERT(server_allow_parse_value(&al, "127.0.0.0/8, 192.168.11.42,100.64.0.0/10",
+                                         err, sizeof(err)));
+    TEST_ASSERT(al.restricted && al.len == 3);
+    TEST_ASSERT(server_allow_permits_text(&al, "127.0.0.1"));
+    TEST_ASSERT(server_allow_permits_text(&al, "127.9.9.9"));
+    TEST_ASSERT(server_allow_permits_text(&al, "192.168.11.42"));
+    TEST_ASSERT(server_allow_permits_text(&al, "100.64.0.5"));
+    TEST_ASSERT(server_allow_permits_text(&al, "100.127.255.255"));
+    TEST_ASSERT(!server_allow_permits_text(&al, "192.168.11.43"));
+    TEST_ASSERT(!server_allow_permits_text(&al, "192.168.12.1"));
+    TEST_ASSERT(!server_allow_permits_text(&al, "100.128.0.0"));
+    TEST_ASSERT(!server_allow_permits_text(&al, "8.8.8.8"));
+
+    /* localhost names the whole loopback block, and a bare address is a /32. */
+    server_allow_list one = {0};
+    memset(err, 0, sizeof(err));
+    TEST_ASSERT(server_allow_parse_value(&one, "localhost", err, sizeof(err)));
+    TEST_ASSERT(one.len == 1 && one.v[0].mask == 0xff000000u);
+    TEST_ASSERT(server_allow_permits_text(&one, "127.5.5.5"));
+    TEST_ASSERT(!server_allow_permits_text(&one, "128.0.0.1"));
+    server_allow_list bare = {0};
+    TEST_ASSERT(server_allow_parse_value(&bare, "10.0.0.5", err, sizeof(err)));
+    TEST_ASSERT(bare.len == 1 && bare.v[0].mask == ~(uint32_t)0);
+
+    /* Prefix edges. */
+    server_allow_list every = {0};
+    TEST_ASSERT(server_allow_parse_value(&every, "0.0.0.0/0", err, sizeof(err)));
+    TEST_ASSERT(server_allow_permits_text(&every, "1.2.3.4"));
+
+    /* A malformed entry has to be fatal, never dropped: a silently skipped spec
+     * would look like a filter that is not there. */
+    static const char *bad[] = {
+        "", " ", "192.168.11.*", "192.168.11", "010.1.1.1", "010.0.0.0/8",
+        "192.168.11.42/24", "10.0.0.0/33", "10.0.0.0/", "10.0.0.0/-1",
+        "10.0.0.0/032", "example.com", "::1", "10.0.0.5,", "10.0.0.5,,10.0.0.6",
+        "10.0.0.5/8", "256.0.0.1",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        server_allow_list probe = {0};
+        memset(err, 0, sizeof(err));
+        TEST_ASSERT(!server_allow_parse_value(&probe, bad[i], err, sizeof(err)));
+        TEST_ASSERT(!probe.restricted);
+        TEST_ASSERT(err[0] != '\0');
+    }
+    /* The host-bits rejection names the network it would have meant. */
+    server_allow_list probe = {0};
+    memset(err, 0, sizeof(err));
+    TEST_ASSERT(!server_allow_parse_value(&probe, "192.168.11.42/24", err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "192.168.11.0/24") != NULL);
+
+    /* Repeating the option accumulates; a duplicate entry does not grow the list. */
+    server_allow_list twice = {0};
+    TEST_ASSERT(server_allow_parse_value(&twice, "10.0.0.0/24", err, sizeof(err)));
+    TEST_ASSERT(server_allow_parse_value(&twice, "10.0.0.0/24,10.9.9.9", err, sizeof(err)));
+    TEST_ASSERT(twice.len == 2);
+
+    /* A peer whose family cannot be inspected is refused once restricted, even
+     * when the length would carry an address. */
+    struct sockaddr_in6 v6;
+    memset(&v6, 0, sizeof(v6));
+    v6.sin6_family = AF_INET6;
+    TEST_ASSERT(!server_allow_permits(&al, (struct sockaddr *)&v6, (socklen_t)sizeof(v6), NULL));
+    struct sockaddr short_sa;
+    memset(&short_sa, 0, sizeof(short_sa));
+    short_sa.sa_family = AF_INET;
+    TEST_ASSERT(!server_allow_permits(&al, &short_sa, (socklen_t)sizeof(short_sa), NULL));
+    /* Unrestricted still admits it: the filter is off, nothing is claimed. */
+    server_allow_list off = {0};
+    TEST_ASSERT(server_allow_permits(&off, &short_sa, (socklen_t)sizeof(short_sa), NULL));
+
+    /* The startup log line round-trips what was parsed. */
+    char list[256];
+    server_allow_describe(&al, list, sizeof(list));
+    TEST_ASSERT(!strcmp(list, "127.0.0.0/8,192.168.11.42/32,100.64.0.0/10"));
+
+    /* One log line per refused peer, so a scan cannot fill stderr. */
+    server_reject_seen seen = {0};
+    TEST_ASSERT(server_reject_first_seen(&seen, 0x0b0b0b0bu));
+    TEST_ASSERT(!server_reject_first_seen(&seen, 0x0b0b0b0bu));
+    for (int i = 0; i < 40; i++)
+        TEST_ASSERT(server_reject_first_seen(&seen, (uint32_t)0x1000000u + (uint32_t)i));
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_server_allow_host_list();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();

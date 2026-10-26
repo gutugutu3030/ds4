@@ -15,6 +15,50 @@ deployment, put authentication and TLS in front of the server.
 `--cors` enables browser cross-origin headers. It does not change the listening
 address or provide access control.
 
+## Which peers can connect
+
+`--host` can be repeated, or take a comma-separated list, so one process can
+hold loopback and a second interface without binding the wildcard:
+
+```sh
+./ds4-server --host 127.0.0.1 --host 100.115.220.98
+```
+
+`--allow-host` filters the *peer* address instead of the local address. Repeat it
+or separate entries with commas; each entry is an IPv4 address, a CIDR prefix, or
+`localhost` for the whole `127.0.0.0/8` block:
+
+```sh
+./ds4-server --host 0.0.0.0 \
+  --allow-host 127.0.0.0/8,192.168.11.42,100.64.0.0/10
+```
+
+The check happens when the connection is accepted, before the request is read, so
+a peer outside the list gets no response and never reaches a client thread or the
+request queue. Each refused address is logged once with the address it used, which
+is how you find the value to add:
+
+```
+ds4-server: refused peer 192.168.11.77: not in --allow-host
+```
+
+An entry with host bits set (`192.168.11.42/24`) is a startup error rather than a
+silent widening to the whole `/24`, and any unparsable value stops startup. With
+no `--allow-host`, every peer the bind address reaches is accepted, which is the
+behaviour earlier versions had; binding anything but `127.0.0.1` then logs a
+warning.
+
+The listener is IPv4 only. A Tailscale peer connecting over the tailnet appears
+with its `100.64.0.0/10` address, so allow that range or the node's address. Two
+things follow from that: an IPv6-only peer cannot reach the server at all, and
+traffic proxied by Tailscale Serve arrives from the proxy rather than from the
+client, so per-client allowlisting needs a direct tailnet connection.
+
+`--allow-host` decides who can talk to the server; it does not encrypt or
+authenticate anything. For an Internet-facing deployment, keep authentication and
+TLS in front of it, and remember `--ui-auth` covers only the chat page while
+`/v1/*` stays unauthenticated to any peer that passes this filter.
+
 The selected build chooses the backend. Pass `-m FILE` for an explicit model.
 Use `--chdir /path/to/ds4` when starting outside the project directory so
 relative runtime files such as Metal kernels can be found.
