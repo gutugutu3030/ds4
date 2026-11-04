@@ -6082,13 +6082,13 @@ kernel void kernel_glm53_router_shared_exact(
         const ushort cohort = sg >> 2;
         uint3 vtg = tg;
         vtg.x = (tg.x - 144u) * 2u + cohort;
-        kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<2, false, 4>(
+        kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<2, false, false, 4>(
             sargs, gw, uw, x, mid, mid, mid, clamp_value,
             scratch + cohort * 512u, vtg, lane, sg & 3u);
         return;
     }
     kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 2,
-                             constant ds4_metal_args_mul_mv &, true>(
+                             constant ds4_metal_args_mul_mv &, false, true>(
         rargs, rw, x, logits, scratch, tg, lane, sg);
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);

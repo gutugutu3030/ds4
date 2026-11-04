@@ -84,7 +84,7 @@ struct ds4_metal_args_mul_mv_ext {
     int16_t r3;
 };
 
-template<short NR0, bool ROUND = false>
+template<short NR0, bool ROUND = false, bool COHERENT_STORE = false>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
         float sumf[NR0],
@@ -121,7 +121,15 @@ static inline void helper_mv_reduce_and_write(
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
         if (tiisg == 0 && sgitg == 0) {
-            dst_f32[r0 + row] = ROUND ? ds4_bf16_round(tot) : tot;
+            const float value = ROUND ? ds4_bf16_round(tot) : tot;
+            if (COHERENT_STORE) {
+                /* The fused GLM router reads these lanes from other simdgroups
+                 * of the same threadgroup, so publish them as atomics. */
+                atomic_store_explicit((device atomic_uint *)(dst_f32 + r0 + row),
+                                      as_type<uint>(value), memory_order_relaxed);
+            } else {
+                dst_f32[r0 + row] = value;
+            }
         }
     }
 }
@@ -1320,7 +1328,7 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
 // same lane that owns the reduced output row.  The point is not to fuse two
 // independent weight streams into one matmul; it is to remove the separate
 // activation pass and its reread of the two 2048-wide rows.
-template<short NR0, bool STORE_GATE_UP, bool ROUND_GATE_UP = false>
+template<short NR0, bool STORE_GATE_UP, bool ROUND_GATE_UP = false, short NSG_OVERRIDE = 0>
 void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0_gate,
@@ -1334,7 +1342,7 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    const short NSG = FC_mul_mv_nsg;
+    const short NSG = NSG_OVERRIDE ? NSG_OVERRIDE : FC_mul_mv_nsg;
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
 
@@ -2132,7 +2140,8 @@ typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
 template [[host_name("kernel_mul_mv_f32_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<float, float>;
 template [[host_name("kernel_mul_mv_f16_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<half,  float>;
 
-template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t, bool ROUND = false>
+template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t,
+         bool ROUND = false, bool COHERENT_STORE = false>
 void kernel_mul_mv_t_t_4_impl(
         args_t args,
         device const char * src0,
@@ -2210,7 +2219,7 @@ void kernel_mul_mv_t_t_4_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, ROUND, COHERENT_STORE>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 template<typename T0, typename T04, typename T1, typename T14, typename args_t, bool ROUND = false>
