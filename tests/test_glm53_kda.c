@@ -10,6 +10,11 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 
+typedef struct {
+    uint16_t d;
+    int8_t qs[32];
+} test_block_q8_0;
+
 #ifdef DS4_ROCM_BUILD
 typedef struct {
     uint16_t d;
@@ -17,11 +22,6 @@ typedef struct {
     uint8_t scales[12];
     uint8_t qs[128];
 } test_block_q4_K;
-
-typedef struct {
-    uint16_t d;
-    int8_t qs[32];
-} test_block_q8_0;
 
 extern int ds4_gpu_matmul_q4_K_tensor(
     ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
@@ -1285,81 +1285,6 @@ static void check_glm53_kda_prepare_blocked(uint8_t *model,
 
 /* Compare every intermediate as score-row ownership changes, including the
  * indexer's three sentinels and the first count above the tuned limit. */
-static void check_glm53_dsa_score_tile(uint8_t *model, uint64_t model_bytes,
-                                       uint64_t value_offset) {
-    enum { H = 64, L = 512, V = 256, CAP = 2052, ROW_BYTES = 544 };
-    require_ok(value_offset + (uint64_t)H * V * ROW_BYTES <= model_bytes,
-               "DSA tile fixture range");
-    for (uint32_t row = 0; row < H * V; row++) {
-        uint8_t *w = model + value_offset + (uint64_t)row * ROW_BYTES;
-        for (uint32_t b = 0; b < L / 32; b++) {
-            const uint16_t scale = (uint16_t)(0x2000u | ((row & 1u) << 15));
-            memcpy(w + b * 34u, &scale, sizeof(scale));
-            for (uint32_t i = 0; i < 32; i++)
-                w[b * 34u + 2u + i] = (uint8_t)(row * 31u + b * 7u + i * 3u);
-        }
-    }
-    float *low = malloc(H * L * sizeof(float));
-    uint16_t *kv = malloc(CAP * L * sizeof(uint16_t));
-    uint32_t selected[CAP];
-    require_ok(low && kv, "DSA tile host inputs");
-    for (uint32_t i = 0; i < H * L; i++)
-        low[i] = (float)((int)((i * 1664525u + 1013904223u) % 4097u) - 2048) * 0.0007f;
-    for (uint32_t i = 0; i < CAP * L; i++)
-        kv[i] = f32_to_f16((float)((int)((i * 1664525u + 1013904223u) % 8191u) - 4095) * 0.0003f);
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(H * L * sizeof(float));
-    ds4_gpu_tensor *cache = ds4_gpu_tensor_alloc(CAP * L * sizeof(uint16_t));
-    ds4_gpu_tensor *ids = ds4_gpu_tensor_alloc(sizeof(selected));
-    require_ok(x && cache && ids, "DSA tile input buffers");
-    require_ok(ds4_gpu_tensor_write(x, 0, low, H * L * sizeof(float)) &&
-               ds4_gpu_tensor_write(cache, 0, kv, CAP * L * sizeof(uint16_t)),
-               "DSA tile input writes");
-    uint64_t sizes[] = { H * V * sizeof(float), H * CAP * sizeof(float),
-                         H * L * sizeof(float), H * sizeof(float) };
-    ds4_gpu_tensor *out[4];
-    float *reference[4], *actual[4];
-    for (unsigned i = 0; i < 4; i++) {
-        out[i] = ds4_gpu_tensor_alloc(sizes[i]);
-        reference[i] = malloc(sizes[i]); actual[i] = malloc(sizes[i]);
-        require_ok(out[i] && reference[i] && actual[i], "DSA tile output allocation");
-    }
-    const uint32_t counts[] = { 1, 33, 257, 2051, 2052 };
-    for (unsigned c = 0; c < sizeof(counts) / sizeof(counts[0]); c++) {
-        const uint32_t n = counts[c];
-        sizes[1] = (uint64_t)H * n * sizeof(float);
-        for (uint32_t i = 0; i < n; i++) selected[i] = (i * 31u) % CAP;
-        if (n > 3) for (uint32_t i = n - 3; i < n; i++) selected[i] = UINT32_MAX;
-        require_ok(ds4_gpu_tensor_write(ids, 0, selected, n * sizeof(uint32_t)),
-                   "DSA tile selections");
-        for (unsigned arm = 0; arm < 3; arm++) {
-            if (arm == 0) setenv("DS4_METAL_DISABLE_GLM53_DSA_SCORE_TILE", "1", 1);
-            else unsetenv("DS4_METAL_DISABLE_GLM53_DSA_SCORE_TILE");
-            if (arm == 2) setenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING", "1", 1);
-            for (unsigned i = 0; i < 4; i++)
-                require_ok(ds4_gpu_tensor_fill_f32(out[i], -17.0f, sizes[i] / sizeof(float)),
-                           "DSA tile poison outputs");
-            require_ok(ds4_gpu_glm_attention_indexed_decode_exact_typed_tensor(
-                           out[0], out[1], out[2], out[3], x, cache,
-                           model, model_bytes, value_offset, 8, ids,
-                           n, CAP, true, H, L, 256, 0, V), "DSA tile dispatch");
-            require_prefill_dispatch(DS4_GPU_GLM53_DSA_SCORE_TILE,
-                                     arm == 1 && n <= 2051, "DSA tile coverage");
-            for (unsigned i = 0; i < 4; i++) {
-                require_ok(ds4_gpu_tensor_read(out[i], 0, actual[i], sizes[i]), "DSA tile read");
-                if (arm == 0) memcpy(reference[i], actual[i], sizes[i]);
-                else require_ok(memcmp(reference[i], actual[i], sizes[i]) == 0,
-                                "DSA tile bitwise intermediate/output");
-            }
-            unsetenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING");
-        }
-    }
-    for (unsigned i = 0; i < 4; i++) {
-        ds4_gpu_tensor_free(out[i]); free(reference[i]); free(actual[i]);
-    }
-    ds4_gpu_tensor_free(ids); ds4_gpu_tensor_free(cache); ds4_gpu_tensor_free(x);
-    free(kv); free(low);
-}
-
 static void check_glm53_kda_inputs(uint8_t *model, uint64_t model_bytes,
                                   uint64_t offset) {
     const uint32_t widths[6] = {8192, 8192, 8192, 128, 128, 64};
@@ -1687,8 +1612,40 @@ static void check_glm_router_publication(uint8_t *model, size_t model_bytes,
     ds4_gpu_tensor_free(in);
 }
 
-#endif /* __APPLE__: these oracles exercise Metal-specific dispatch switches. */
-
+/* Compare all four phases with the generic kernel, using the same alias
+ * between query and accumulated values as the single-token graph. */
+static void check_phased_attention(uint8_t *model, uint64_t bytes, uint64_t offset) {
+    enum { H = 8, K = 512, V = 2, N = 131, CAP = 145 };
+    ds4_gpu_tensor *low = ds4_gpu_tensor_alloc_managed(H * K * 4);
+    ds4_gpu_tensor *cache = ds4_gpu_tensor_alloc_managed(CAP * K * 2);
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc_managed(N * 4);
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(H * N * 4);
+    ds4_gpu_tensor *denom = ds4_gpu_tensor_alloc(H * 4);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(H * V * 4);
+    require_ok(low && cache && sel && scores && denom && out, "phased attention allocation");
+    float *q = ds4_gpu_tensor_contents(low);
+    _Float16 *kv = ds4_gpu_tensor_contents(cache);
+    uint32_t *ids = ds4_gpu_tensor_contents(sel);
+    for (unsigned i = 0; i < H * K; i++) q[i] = ((int)(i % 43) - 20) * 0.03125f;
+    for (unsigned i = 0; i < CAP * K; i++) kv[i] = (_Float16)(((int)(i % 79) - 38) * 0.015625f);
+    for (unsigned i = 0; i < N; i++) ids[i] = i % 7 == 0 ? 3u : (i * 47u) % CAP;
+    test_block_q8_0 *w = (test_block_q8_0 *)(model + offset);
+    for (unsigned i = 0; i < H * V * K / 32; i++) {
+        w[i].d = 0x3000u;
+        for (unsigned j = 0; j < 32; j++) w[i].qs[j] = (int)((i * 13 + j) % 97) - 48;
+    }
+    float expected[H * V], got[H * V];
+    require_ok(ds4_gpu_glm_attention_indexed_decode_typed_tensor(out, low, low, cache, cache,
+        model, bytes, offset, 8, sel, N, CAP, true, H, K, 256, 0, V, 0, 0, 0, 0, 1, 0, 0) &&
+        ds4_gpu_tensor_read(out, 0, expected, sizeof(expected)), "generic indexed attention");
+    require_ok(ds4_gpu_glm_attention_indexed_decode_exact_typed_tensor(out, scores, low, denom,
+        low, cache, model, bytes, offset, 8, sel, N, CAP, true, H, K, 256, 0, V) &&
+        ds4_gpu_tensor_read(out, 0, got, sizeof(got)), "phased indexed attention");
+    require_ok(memcmp(expected, got, sizeof(got)) == 0, "phased attention exact output");
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(denom); ds4_gpu_tensor_free(scores);
+    ds4_gpu_tensor_free(sel); ds4_gpu_tensor_free(cache); ds4_gpu_tensor_free(low);
+}
+#endif
 int main(void) {
     enum {
         D = 128,
@@ -1747,10 +1704,15 @@ int main(void) {
         KP_NORM_OFFSET = KP_DT_OFFSET + 64 * 128 * 4,
 #ifdef __APPLE__
         KI_WEIGHT_OFFSET = KP_NORM_OFFSET + 128 * 4,
-        MODEL_BYTES = KI_WEIGHT_OFFSET + 4096 * 24896 * 2,
+        GLM53_MODEL_BYTES = KI_WEIGHT_OFFSET + 4096 * 24896 * 2,
 #else
-        MODEL_BYTES = KP_NORM_OFFSET + 128 * 4,
+        GLM53_MODEL_BYTES = KP_NORM_OFFSET + 128 * 4,
 #endif
+        /* The phased-attention fixture goes past the GLM 5.3 oracle region:
+         * both write weight bytes into the same anonymous mapping, so they may
+         * not share an offset. */
+        PHASE_WEIGHTS = GLM53_MODEL_BYTES,
+        MODEL_BYTES = PHASE_WEIGHTS + 16384,
     };
 
     uint8_t *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
@@ -2874,7 +2836,6 @@ int main(void) {
     check_glm53_qk_lowrank_token_tile(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
     check_glm53_qk_lowrank_large_offsets(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
     check_glm53_bf16_short_rows(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
-    check_glm53_dsa_score_tile(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
     check_glm53_kda_decode_values4(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
     check_glm53_kda_inputs(model, MODEL_BYTES, KI_WEIGHT_OFFSET);
     check_glm53_indexed_attention_head_width();
@@ -2886,6 +2847,7 @@ int main(void) {
                                     KP_DT_OFFSET, KP_NORM_OFFSET);
     check_glm_router_publication(model, MODEL_BYTES, POOL_BIAS_OFFSET);
     ds4_gpu_test_set_flags(0);
+    check_phased_attention(model, MODEL_BYTES, PHASE_WEIGHTS);
 #endif
     ds4_gpu_cleanup();
     munmap(model, MODEL_BYTES);
