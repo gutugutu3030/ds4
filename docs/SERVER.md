@@ -110,6 +110,14 @@ until the tab closes; there is no logout.
 | `POST /v1/completions` | Text completions |
 | `POST /v1/messages` | Anthropic-style messages |
 
+The four POST endpoints require `Content-Type: application/json`. Another type,
+or none at all, is refused with `415` before the body is parsed. A browser sends
+a POST without a CORS preflight when the type is missing or one of the three
+form-safe types (`text/plain`, `application/x-www-form-urlencoded`,
+`multipart/form-data`), so without this check a web page opened on this machine
+could make the server run a completion it cannot read. `--allow-host` does not
+stop that request: it comes from a permitted `127.0.0.1`.
+
 The Flash and PRO names accepted by the model endpoints are compatibility
 aliases, not separate loaded models. The GGUF passed at startup selects the model.
 

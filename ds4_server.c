@@ -6934,6 +6934,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
+                         code == 415 ? "Unsupported Media Type" :
                          code == 500 ? "Internal Server Error" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
@@ -15051,6 +15052,7 @@ typedef struct {
     char method[8];
     char path[256];
     char auth[512];
+    char content_type[64];
     char *body;
     size_t body_len;
 } http_request;
@@ -15162,11 +15164,44 @@ static bool read_http_request(int fd, http_request *r) {
     r->body[r->body_len] = '\0';
     (void)header_value(b.ptr, (size_t)hend, "Authorization",
                        r->auth, sizeof(r->auth));
+    (void)header_value(b.ptr, (size_t)hend, "Content-Type",
+                       r->content_type, sizeof(r->content_type));
     buf_free(&b);
     return true;
 fail:
     buf_free(&b);
     return false;
+}
+
+/* The POST routes whose body is a JSON request.  The UI page and the model
+ * listing keep taking whatever their clients send. */
+static bool server_json_route(const char *path) {
+    static const char *const routes[] = {
+        "/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages",
+    };
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+        if (!strcmp(path, routes[i])) return true;
+    }
+    return false;
+}
+
+/* Those routes accept only application/json.  A browser sends a POST without a
+ * CORS preflight when Content-Type is absent or one of the three form-safe
+ * types (text/plain, application/x-www-form-urlencoded, multipart/form-data),
+ * so a page on any origin could otherwise make this server run a completion it
+ * cannot read: --allow-host sees the peer, and a request from this machine's
+ * own browser arrives from a permitted 127.0.0.1.  Naming the single accepted
+ * media type sends every cross-origin POST through a preflight, which this
+ * server answers without CORS headers unless --enable-cors was given. */
+static bool request_content_type_is_json(const char *content_type) {
+    static const char json_type[] = "application/json";
+    const size_t json_len = sizeof(json_type) - 1;
+    const char *p = content_type;
+    if (!p) return false;
+    while (isspace((unsigned char)*p)) p++;
+    if (strncasecmp(p, json_type, json_len) != 0) return false;
+    p += json_len;
+    return *p == '\0' || *p == ';' || isspace((unsigned char)*p);
 }
 
 /* Compares a secret against a NUL-terminated expectation without branching on
@@ -16056,6 +16091,15 @@ static void *client_main(void *arg) {
     char err[160];
     bool ok = false;
     const int ctx_size = s->ctx_size;
+    if (!strcmp(hr.method, "POST") && server_json_route(hr.path) &&
+        !request_content_type_is_json(hr.content_type)) {
+        /* Refused before the body is parsed, so a form-encoded request never
+         * reaches the prompt renderer or a session slot. */
+        http_error(fd, s->enable_cors, 415,
+                   "this endpoint requires Content-Type: application/json");
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -18367,6 +18411,54 @@ static void test_http_request_captures_authorization(void) {
         close(sv[0]);
         close(sv[1]);
     }
+}
+
+static void test_http_request_captures_content_type(void) {
+    int sv[2];
+    const char *request =
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Content-Length: 2\r\n\r\n{}";
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(send_all(sv[0], request, strlen(request)));
+        shutdown(sv[0], SHUT_WR);
+        http_request r = {0};
+        TEST_ASSERT(read_http_request(sv[1], &r));
+        TEST_ASSERT(!strcmp(r.method, "POST"));
+        TEST_ASSERT(!strcmp(r.content_type, "application/json; charset=utf-8"));
+        TEST_ASSERT(request_content_type_is_json(r.content_type));
+        http_request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    /* The media types a browser sends without a preflight, and no type at all:
+     * these are what a web page can reach the JSON routes with. */
+    TEST_ASSERT(!request_content_type_is_json(""));
+    TEST_ASSERT(!request_content_type_is_json(NULL));
+    TEST_ASSERT(!request_content_type_is_json("text/plain"));
+    TEST_ASSERT(!request_content_type_is_json("text/plain;charset=UTF-8"));
+    TEST_ASSERT(!request_content_type_is_json("application/x-www-form-urlencoded"));
+    TEST_ASSERT(!request_content_type_is_json("multipart/form-data; boundary=x"));
+    TEST_ASSERT(!request_content_type_is_json("application/jsonp"));
+    TEST_ASSERT(!request_content_type_is_json("application/json5"));
+    /* The accepted spellings of the one media type these routes speak. */
+    TEST_ASSERT(request_content_type_is_json("application/json"));
+    TEST_ASSERT(request_content_type_is_json("APPLICATION/JSON"));
+    TEST_ASSERT(request_content_type_is_json("application/json;charset=utf-8"));
+    TEST_ASSERT(request_content_type_is_json("application/json ; charset=utf-8"));
+    TEST_ASSERT(request_content_type_is_json("  application/json  \t"));
+
+    /* Only the JSON body routes are gated. */
+    TEST_ASSERT(server_json_route("/v1/chat/completions"));
+    TEST_ASSERT(server_json_route("/v1/completions"));
+    TEST_ASSERT(server_json_route("/v1/responses"));
+    TEST_ASSERT(server_json_route("/v1/messages"));
+    TEST_ASSERT(!server_json_route("/"));
+    TEST_ASSERT(!server_json_route("/v1/models"));
+    TEST_ASSERT(!server_json_route("/v1/chat/completions/extra"));
 }
 
 static void test_ui_basic_auth_credentials(void) {
@@ -24566,6 +24658,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
     test_http_request_captures_authorization();
+    test_http_request_captures_content_type();
     test_ui_basic_auth_credentials();
     test_ui_unauthorized_sends_basic_challenge();
     test_ui_auth_gates_the_chat_page();
